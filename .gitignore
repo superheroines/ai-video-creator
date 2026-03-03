@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# macOS
+.DS_Store
+icon.iconset/
+
+# Distribution archives
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+*.code-workspace
+
+# Generated icons
+icon.icns
