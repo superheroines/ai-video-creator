@@ -23,6 +23,7 @@ import shutil
 import threading
 import logging
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -233,7 +234,8 @@ def validate_export(filepath: str) -> dict[str, bool]:
 # ── Core processing ─────────────────────────────────────────────────────────
 
 def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
-              padding: int = 20, black_end: float | None = None) -> None:
+              padding: int = 20, black_end: float | None = None,
+              on_progress: object = None) -> None:
     """Overlay *logo* on *src* video; write Bunny Stream-safe MP4 to *dst*.
 
     Produces H.264 High Profile 4.1, yuv420p, Rec.709, CFR, with
@@ -241,8 +243,11 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
 
     If *black_end* is set, composites the first visible frame over
     the black leader so frame 0 is not pure black.
+
+    If *on_progress* is a callable, it is called with a float 0.0–1.0
+    representing encoding progress.
     """
-    w, h, _dur, fps = probe(src)
+    w, h, dur, fps = probe(src)
     if w == 0:
         raise RuntimeError("Cannot read video dimensions")
     if fps <= 0:
@@ -311,10 +316,33 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
         "-vsync", "cfr",
         str(dst),
     ]
-    r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                       errors="replace", timeout=1800)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr[-800:])
+    time_re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stderr_buf = []
+    buf = ""
+    for char in iter(lambda: proc.stderr.read(1), ""):
+        if char in ("\r", "\n"):
+            if buf.strip():
+                stderr_buf.append(buf)
+                if on_progress and dur > 0:
+                    match = time_re.search(buf)
+                    if match:
+                        hh, mm, ss = match.groups()
+                        elapsed = int(hh) * 3600 + int(mm) * 60 + float(ss)
+                        on_progress(min(elapsed / dur, 1.0))
+            buf = ""
+        else:
+            buf += char
+    proc.wait()
+    if proc.returncode != 0:
+        err_text = "\n".join(stderr_buf[-20:])
+        raise RuntimeError(err_text[-800:])
 
     # Clean up temp first-frame PNG
     if first_frame:
@@ -322,6 +350,46 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
             os.remove(first_frame)
         except OSError:
             pass
+
+
+def watermark_preview_frame(src: str, logo: str, logo_pct: int = 10,
+                            padding: int = 20) -> str | None:
+    """Extract one frame from *src*, overlay *logo*, return path to temp PNG.
+
+    Returns None on failure. Caller is responsible for deleting the temp file.
+    """
+    w, h, dur, fps = probe(src)
+    if w == 0:
+        return None
+    if fps <= 0:
+        fps = 30.0
+
+    seek = min(dur * 0.10, 5.0) if dur > 0 else 0
+    logo_w = max(int(w * logo_pct / 100), 20)
+
+    # Preview at max 960px wide for display
+    filt = (
+        f"[1:v]scale={logo_w}:-1:flags=lanczos,format=rgba[logo];"
+        f"[0:v][logo]overlay={padding}:main_h-overlay_h-{padding},"
+        f"scale=960:-2:flags=lanczos,format=rgb24[out]"
+    )
+
+    tmp = tempfile.mktemp(suffix=".png", prefix="wm_preview_")
+    cmd = [
+        FFMPEG, "-y",
+        "-ss", f"{seek:.3f}",
+        "-i", str(src),
+        "-i", str(logo),
+        "-filter_complex", filt,
+        "-map", "[out]",
+        "-vframes", "1",
+        str(tmp),
+    ]
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                       errors="replace", timeout=30)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        return None
+    return tmp
 
 
 def snapshots(video: str, out_dir: str, prefix: str,
@@ -417,9 +485,11 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video Batch Processor")
-        self.root.geometry("700x620")
-        self.root.resizable(False, False)
+        self.root.geometry("750x780")
+        self.root.minsize(700, 620)
+        self.root.resizable(True, True)
         self.processing = False
+        self._failed_videos: list[str] = []
         self.cfg = load_config()
         self._build_ui()
         self._restore()
@@ -487,6 +557,8 @@ class App:
         self.pct_lbl.pack(side="left")
         self.pct_var.trace_add("write",
             lambda *_: self.pct_lbl.config(text=f"{self.pct_var.get()} %"))
+        ttk.Button(r2, text="Preview",
+                   command=self._preview_watermark).pack(side="left", padx=(15, 0))
 
         r3 = ttk.Frame(sf)
         r3.pack(fill="x", pady=2)
@@ -497,25 +569,36 @@ class App:
 
         # ── Progress ──
         pf = ttk.LabelFrame(m, text="Progress", padding=8)
-        pf.pack(fill="x", padx=6, pady=4)
+        pf.pack(fill="both", expand=True, padx=6, pady=4)
 
         self.pbar = ttk.Progressbar(pf, maximum=100)
         self.pbar.pack(fill="x", pady=(0, 4))
         self.status = tk.StringVar(value="Ready")
         ttk.Label(pf, textvariable=self.status).pack(anchor="w")
-        self.log = tk.Text(pf, height=8, font=("Courier", 9),
+        self.log = tk.Text(pf, height=10, font=("Courier", 9),
                            state="disabled", bg="#f5f5f5")
-        self.log.pack(fill="x", pady=(4, 0))
+        self.log.pack(fill="both", expand=True, pady=(4, 0))
 
         # ── Buttons ──
         bf = ttk.Frame(m)
         bf.pack(fill="x", pady=(8, 0))
+
+        # Right side — processing buttons
         self.go_btn = ttk.Button(bf, text="  Process Videos  ",
                                  command=self._start)
         self.go_btn.pack(side="right", padx=4)
         self.stop_btn = ttk.Button(bf, text="Cancel",
                                    command=self._cancel, state="disabled")
         self.stop_btn.pack(side="right")
+        self.retry_btn = ttk.Button(bf, text="Retry Failed",
+                                    command=self._retry_failed)
+        # retry_btn is not packed until needed
+
+        # Left side — utility buttons
+        ttk.Button(bf, text="Open Output",
+                   command=self._open_output).pack(side="left", padx=4)
+        ttk.Button(bf, text="View Ledger",
+                   command=self._view_ledger).pack(side="left", padx=4)
 
     # ── row builders ────────────────────────────────────────────────────────
 
@@ -583,6 +666,219 @@ class App:
         else:
             self.ledger_lbl.config(text="")
 
+    # ── Phase 1: Open Output Folder ──────────────────────────────────────────
+
+    def _open_output(self) -> None:
+        out = self.out_var.get().strip()
+        if out and os.path.isdir(out):
+            subprocess.run(["open", out])
+        else:
+            messagebox.showinfo("No Folder", "Set a valid output folder first.")
+
+    # ── Phase 3: View Ledger ─────────────────────────────────────────────────
+
+    def _view_ledger(self) -> None:
+        out = self.out_var.get().strip()
+        prefix = self.prefix_var.get()
+        if not out or not os.path.isdir(out):
+            messagebox.showinfo("No Folder", "Set a valid output folder first.")
+            return
+
+        ledger = load_ledger(out, prefix)
+        videos = ledger.get("videos", [])
+
+        win = tk.Toplevel(self.root)
+        win.title("Ledger")
+        win.geometry("720x420")
+        win.transient(self.root)
+
+        ttk.Label(win, text=f"Ledger: {len(videos)} videos  |  "
+                  f"Next: {ledger.get('next', '?')}",
+                  font=("Helvetica", 12, "bold"),
+                  padding=10).pack(anchor="w")
+
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        cols = ("seq", "original", "processed", "validation")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=15)
+        tree.heading("seq", text="Seq #")
+        tree.heading("original", text="Original File")
+        tree.heading("processed", text="Date")
+        tree.heading("validation", text="Validation")
+        tree.column("seq", width=80, anchor="center")
+        tree.column("original", width=280)
+        tree.column("processed", width=160, anchor="center")
+        tree.column("validation", width=120, anchor="center")
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for v in videos:
+            checks = v.get("validation", {})
+            all_pass = all(checks.values()) if checks else None
+            status = "PASS" if all_pass is True else (
+                "FAIL" if all_pass is False else "?")
+            tree.insert("", "end", values=(
+                v.get("seq", ""),
+                v.get("original", ""),
+                v.get("processed", ""),
+                status,
+            ))
+
+    # ── Phase 4: Watermark Preview ───────────────────────────────────────────
+
+    def _preview_watermark(self) -> None:
+        inp = self.inp_var.get().strip()
+        logo = self.logo_var.get().strip()
+        if not inp or not os.path.isdir(inp):
+            messagebox.showerror("Error", "Select a valid input folder.")
+            return
+        if not logo or not os.path.isfile(logo):
+            messagebox.showerror("Error", "Select a valid logo file.")
+            return
+
+        videos = sorted(
+            f for f in os.listdir(inp)
+            if Path(f).suffix.lower() in VIDEO_EXTENSIONS
+        )
+        if not videos:
+            messagebox.showinfo("No Videos", "No video files in the input folder.")
+            return
+
+        src = os.path.join(inp, videos[0])
+        pct = self.pct_var.get()
+        try:
+            pad = int(self.pad_var.get() or 20)
+        except ValueError:
+            pad = 20
+
+        self.status.set("Generating preview...")
+        self.root.update_idletasks()
+
+        def _generate() -> None:
+            tmp = watermark_preview_frame(src, logo, pct, pad)
+            self.root.after(0, lambda: self._show_preview(tmp, videos[0]))
+
+        threading.Thread(target=_generate, daemon=True).start()
+
+    def _show_preview(self, img_path: str | None, filename: str) -> None:
+        self.status.set("Ready")
+        if img_path is None:
+            messagebox.showerror("Preview Failed",
+                                 "Could not generate preview frame.")
+            return
+
+        try:
+            win = tk.Toplevel(self.root)
+            win.title(f"Watermark Preview — {filename}")
+            win.transient(self.root)
+
+            photo = tk.PhotoImage(file=img_path)
+            # Store reference to prevent garbage collection
+            win._photo = photo
+
+            label = ttk.Label(win, image=photo)
+            label.pack(padx=10, pady=10)
+
+            def _refresh() -> None:
+                win.destroy()
+                self._preview_watermark()
+
+            ttk.Button(win, text="Refresh Preview",
+                       command=_refresh).pack(pady=(0, 10))
+        finally:
+            try:
+                os.remove(img_path)
+            except OSError:
+                pass
+
+    # ── Phase 7: File Selection Dialog ───────────────────────────────────────
+
+    def _show_file_selection(self, inp: str, out: str, logo: str,
+                             videos: list[str]) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Select Videos to Process")
+        win.geometry("550x450")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text=f"Found {len(videos)} videos in input folder",
+                  font=("Helvetica", 12, "bold"),
+                  padding=10).pack(anchor="w")
+
+        btn_frame = ttk.Frame(win, padding=(10, 0))
+        btn_frame.pack(fill="x")
+
+        check_vars: dict[str, tk.BooleanVar] = {}
+
+        def select_all() -> None:
+            for var in check_vars.values():
+                var.set(True)
+
+        def select_none() -> None:
+            for var in check_vars.values():
+                var.set(False)
+
+        ttk.Button(btn_frame, text="Select All",
+                   command=select_all).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="Select None",
+                   command=select_none).pack(side="left", padx=2)
+
+        # Check which videos are already processed
+        prefix = self.prefix_var.get()
+        ledger = load_ledger(out, prefix)
+        processed = {v["original"] for v in ledger.get("videos", [])}
+
+        # Scrollable checkbox list
+        canvas = tk.Canvas(win)
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True, padx=10, pady=5)
+        scrollbar.pack(side="right", fill="y", pady=5)
+
+        # Mousewheel scrolling
+        def _on_mousewheel(event: tk.Event) -> None:
+            canvas.yview_scroll(-1 * event.delta, "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        win.bind("<Destroy>",
+                 lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is win else None)
+
+        for fname in videos:
+            already = fname in processed
+            var = tk.BooleanVar(value=not already)
+            check_vars[fname] = var
+            text = f"{fname}  (already processed)" if already else fname
+            ttk.Checkbutton(scroll_frame, text=text,
+                            variable=var).pack(anchor="w", padx=5, pady=1)
+
+        # Start / Cancel buttons
+        bottom = ttk.Frame(win, padding=10)
+        bottom.pack(fill="x")
+
+        def _go() -> None:
+            selected = [f for f, var in check_vars.items() if var.get()]
+            win.destroy()
+            if not selected:
+                messagebox.showinfo("Nothing Selected", "No videos selected.")
+                return
+            self._begin_processing(inp, out, logo, selected)
+
+        ttk.Button(bottom, text="Cancel",
+                   command=win.destroy).pack(side="right", padx=4)
+        ttk.Button(bottom, text="Process Selected",
+                   command=_go).pack(side="right", padx=4)
+
     # ── processing ──────────────────────────────────────────────────────────
 
     def _start(self) -> None:
@@ -616,10 +912,16 @@ class App:
                                 "No video files found in the input folder.")
             return
 
+        self._show_file_selection(inp, out, logo, videos)
+
+    def _begin_processing(self, inp: str, out: str, logo: str,
+                          videos: list[str]) -> None:
         self._persist()
         self.processing = True
+        self._failed_videos = []
         self.go_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.retry_btn.pack_forget()
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
@@ -635,7 +937,10 @@ class App:
              videos: list[str]) -> None:
         prefix = self.prefix_var.get()
         pct = self.pct_var.get()
-        pad = int(self.pad_var.get() or 20)
+        try:
+            pad = int(self.pad_var.get() or 20)
+        except ValueError:
+            pad = 20
         total = len(videos)
 
         os.makedirs(out, exist_ok=True)
@@ -643,11 +948,24 @@ class App:
         self._ui(log=f"Found {total} video(s) to process")
         self._ui(log=f"Ledger: starting at {prefix}{ledger['next']:03d}\n")
 
+        # Phase 2: build set of already-processed originals
+        processed_originals = {v["original"] for v in ledger["videos"]}
+
         completed = 0
+        skipped = 0
         for i, fname in enumerate(videos):
             if not self.processing:
                 self._ui(log="— Cancelled —")
                 break
+
+            # Phase 2: skip already-processed
+            if fname in processed_originals:
+                self._ui(
+                    log=f"[{i + 1}/{total}]  {fname} — already processed, skipping",
+                    progress=(i + 1) / total * 100,
+                )
+                skipped += 1
+                continue
 
             num = ledger["next"]
             seq = f"{prefix}{num:03d}"
@@ -668,9 +986,22 @@ class App:
                 if black_end is not None:
                     self._ui(log=f"        black detected: {black_end:.2f}s — will replace")
 
+                # Phase 5: progress callback for encoding
+                def _on_encode_progress(frac: float,
+                                        _i: int = i, _total: int = total) -> None:
+                    pct_str = f"{frac * 100:.0f}%"
+                    file_base = _i / _total
+                    file_weight = 1.0 / _total
+                    overall = (file_base + frac * file_weight * 0.8) * 100
+                    self._ui(
+                        status=f"Encoding {seq}  ({_i + 1}/{_total})  {pct_str}",
+                        progress=overall,
+                    )
+
                 # Watermark + encode (broadcast-safe)
-                self._ui(log="        adding watermark…")
-                watermark(src, logo, dst, pct, pad, black_end=black_end)
+                self._ui(log="        encoding with watermark…")
+                watermark(src, logo, dst, pct, pad, black_end=black_end,
+                          on_progress=_on_encode_progress)
 
                 # Validate export
                 self._ui(log="        validating export…")
@@ -705,22 +1036,60 @@ class App:
                 completed += 1
             except Exception as exc:
                 self._ui(log=f"        ✗ ERROR: {exc}\n")
+                self._failed_videos.append(fname)
+                # Clean up partial output
+                shutil.rmtree(vdir, ignore_errors=True)
 
             self._ui(progress=(i + 1) / total * 100)
 
-        self._ui(log=f"Done — {completed}/{total} videos processed successfully.")
+        # Summary
+        parts = [f"{completed} processed"]
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if self._failed_videos:
+            parts.append(f"{len(self._failed_videos)} failed")
+        self._ui(log=f"Done — {', '.join(parts)}.")
         self.root.after(0, lambda c=completed: self._done(c))
 
     def _done(self, completed: int) -> None:
         self.processing = False
         self.go_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
-        self.status.set(f"Complete ✓  ({completed} videos)")
         self._refresh_ledger_label()
+
+        if self._failed_videos:
+            self.retry_btn.pack(side="right", padx=4)
+            self.status.set(
+                f"Complete ({completed} ok, {len(self._failed_videos)} failed)")
+        else:
+            self.retry_btn.pack_forget()
+            self.status.set(f"Complete ✓  ({completed} videos)")
 
     def _cancel(self) -> None:
         self.processing = False
         self.status.set("Cancelling…")
+
+    # ── Phase 6: Retry Failed ────────────────────────────────────────────────
+
+    def _retry_failed(self) -> None:
+        if not self._failed_videos:
+            return
+
+        inp = self.inp_var.get().strip()
+        out = self.out_var.get().strip()
+        logo = self.logo_var.get().strip()
+
+        still_exist = [f for f in self._failed_videos
+                       if os.path.isfile(os.path.join(inp, f))]
+
+        if not still_exist:
+            messagebox.showinfo("Nothing to Retry",
+                                "Failed videos are no longer in the input folder.")
+            self._failed_videos = []
+            self.retry_btn.pack_forget()
+            return
+
+        self._begin_processing(inp, out, logo, still_exist)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
