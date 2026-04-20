@@ -256,12 +256,13 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
     gop = max(int(round(fps * 2)), 1)
     logo_w = max(int(w * logo_pct / 100), 20)
 
-    # Common tail: even-pad, yuv420p, CFR, Rec.709 tags
+    # Common tail: even-pad, yuv420p, CFR, Rec.709 tags, reset PTS to zero
     tail = (
         f"pad=ceil(iw/2)*2:ceil(ih/2)*2,"
         f"format=yuv420p,"
         f"fps={fps},"
-        f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+        f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
+        f"setpts=PTS-STARTPTS"
     )
 
     if black_end is not None and black_end > 0:
@@ -288,6 +289,8 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
     cmd += [
         "-filter_complex", filt,
         "-map", "[out]", "-map", "0:a?",
+        # Reset audio timestamps to zero (matches video setpts)
+        "-af", "asetpts=PTS-STARTPTS",
         # Video codec
         "-c:v", "libx264",
         "-preset", "medium",
@@ -306,14 +309,14 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
         "-ac", "2",
         "-ar", "48000",
         # Container
-        "-movflags", "+faststart",
+        "-movflags", "+faststart+negative_cts_offsets",
         # Timestamps
         "-avoid_negative_ts", "make_zero",
         "-fflags", "+genpts",
         # Metadata
         "-map_metadata", "-1",
-        # CFR enforcement
-        "-vsync", "cfr",
+        # CFR enforcement (fps_mode replaces deprecated -vsync)
+        "-fps_mode", "cfr",
         str(dst),
     ]
     time_re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
