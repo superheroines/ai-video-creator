@@ -5,7 +5,7 @@ Video Batch Processor
 A simple desktop app that processes raw videos by:
   1. Adding a logo watermark (bottom-left)
   2. Extracting 24 evenly-spaced thumbnail snapshots + contact sheet
-  3. Exporting with sequential naming (Video-001, Video-002, …)
+  3. Exporting with auto-generated names: <shape>-<class>-<timestamp>-<NNN>.mp4
 
 Requirements:
     Python 3.8+
@@ -121,6 +121,41 @@ def probe(filepath: str) -> tuple[int, int, float, float]:
     except (ValueError, ZeroDivisionError):
         fps = 0.0
     return w, h, dur, fps
+
+
+def classify_shape(w: int, h: int) -> str:
+    """Classify aspect ratio as portrait, landscape, or square."""
+    if w > h:
+        return "landscape"
+    if h > w:
+        return "portrait"
+    return "square"
+
+
+def scan_input_videos(inp: str) -> list[tuple[str, str, str]]:
+    """Scan input folder for videos, supporting optional sfw/nsfw subfolders.
+
+    Returns list of (filename, full_path, class_code) tuples.
+    class_code is 's' for sfw subfolder, 'a' for nsfw subfolder,
+    or None for files in the root (caller supplies default).
+    """
+    results = []
+    sfw_dir = os.path.join(inp, "sfw")
+    nsfw_dir = os.path.join(inp, "nsfw")
+    has_subfolders = os.path.isdir(sfw_dir) or os.path.isdir(nsfw_dir)
+
+    if has_subfolders:
+        for subdir, cls in [(sfw_dir, "s"), (nsfw_dir, "a")]:
+            if os.path.isdir(subdir):
+                for f in sorted(os.listdir(subdir)):
+                    if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
+                        results.append((f, os.path.join(subdir, f), cls))
+    else:
+        for f in sorted(os.listdir(inp)):
+            if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
+                results.append((f, os.path.join(inp, f), None))
+
+    return results
 
 
 # ── Safety checks ──────────────────────────────────────────────────────────
@@ -443,36 +478,19 @@ def snapshots(video: str, out_dir: str, prefix: str,
         )
 
 
-def detect_next_seq(folder: str, prefix: str) -> int | None:
-    """Scan *folder* for existing Video-NNN dirs; return next number."""
-    if not folder or not os.path.isdir(folder):
-        return None
-    hi = 0
-    for name in os.listdir(folder):
-        if os.path.isdir(os.path.join(folder, name)) and name.startswith(prefix):
-            try:
-                hi = max(hi, int(name[len(prefix):]))
-            except ValueError:
-                pass
-    return hi + 1 if hi else None
-
-
 # ── Ledger ─────────────────────────────────────────────────────────────────
 
 LEDGER_FILE = "ledger.json"
 
 
-def load_ledger(output_folder: str, prefix: str) -> dict:
-    """Load ledger.json from the output folder.
-    If missing, seeds 'next' from existing folders (migration) or defaults to 1."""
+def load_ledger(output_folder: str) -> dict:
+    """Load ledger.json from the output folder."""
     path = os.path.join(output_folder, LEDGER_FILE)
     try:
         with open(path, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        # First-run migration: detect from existing folders
-        nxt = detect_next_seq(output_folder, prefix)
-        return {"next": nxt or 1, "videos": []}
+        return {"videos": []}
 
 
 def save_ledger(output_folder: str, ledger: dict) -> None:
@@ -492,7 +510,7 @@ class App:
         self.root.minsize(700, 620)
         self.root.resizable(True, True)
         self.processing = False
-        self._failed_videos: list[str] = []
+        self._failed_videos: list[tuple[str, str, str]] = []  # (fname, path, cls)
         self.cfg = load_config()
         self._build_ui()
         self._restore()
@@ -544,9 +562,10 @@ class App:
 
         r1 = ttk.Frame(sf)
         r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="Prefix:", width=14, anchor="e").pack(side="left")
-        self.prefix_var = tk.StringVar(value="Video-")
-        ttk.Entry(r1, textvariable=self.prefix_var, width=14).pack(side="left", padx=5)
+        ttk.Label(r1, text="Default Class:", width=14, anchor="e").pack(side="left")
+        self.class_var = tk.StringVar(value="adult")
+        ttk.OptionMenu(r1, self.class_var, "adult", "adult", "safe").pack(
+            side="left", padx=5)
         self.ledger_lbl = ttk.Label(r1, text="", foreground="gray")
         self.ledger_lbl.pack(side="left", padx=(20, 0))
 
@@ -640,18 +659,19 @@ class App:
     def _restore(self) -> None:
         c = self.cfg
         for key, var in [("input", self.inp_var), ("output", self.out_var),
-                         ("logo", self.logo_var), ("prefix", self.prefix_var),
-                         ("padding", self.pad_var)]:
+                         ("logo", self.logo_var), ("padding", self.pad_var)]:
             if key in c:
                 var.set(str(c[key]))
         if "pct" in c:
             self.pct_var.set(c["pct"])
+        if "default_class" in c:
+            self.class_var.set(c["default_class"])
         self._refresh_ledger_label()
 
     def _persist(self) -> None:
         save_config({
             "input": self.inp_var.get(), "output": self.out_var.get(),
-            "logo": self.logo_var.get(), "prefix": self.prefix_var.get(),
+            "logo": self.logo_var.get(), "default_class": self.class_var.get(),
             "padding": self.pad_var.get(), "pct": self.pct_var.get(),
         })
 
@@ -659,17 +679,14 @@ class App:
 
     def _refresh_ledger_label(self) -> None:
         out = self.out_var.get().strip()
-        prefix = self.prefix_var.get()
         if out and os.path.isdir(out):
-            ledger = load_ledger(out, prefix)
-            nxt = ledger["next"]
+            ledger = load_ledger(out)
             count = len(ledger["videos"])
-            self.ledger_lbl.config(
-                text=f"Next: {prefix}{nxt:03d}  ({count} in ledger)")
+            self.ledger_lbl.config(text=f"{count} in ledger")
         else:
             self.ledger_lbl.config(text="")
 
-    # ── Phase 1: Open Output Folder ──────────────────────────────────────────
+    # ── Open Output Folder ───────────────────────────────────────────────────
 
     def _open_output(self) -> None:
         out = self.out_var.get().strip()
@@ -678,41 +695,43 @@ class App:
         else:
             messagebox.showinfo("No Folder", "Set a valid output folder first.")
 
-    # ── Phase 3: View Ledger ─────────────────────────────────────────────────
+    # ── View Ledger ──────────────────────────────────────────────────────────
 
     def _view_ledger(self) -> None:
         out = self.out_var.get().strip()
-        prefix = self.prefix_var.get()
         if not out or not os.path.isdir(out):
             messagebox.showinfo("No Folder", "Set a valid output folder first.")
             return
 
-        ledger = load_ledger(out, prefix)
+        ledger = load_ledger(out)
         videos = ledger.get("videos", [])
 
         win = tk.Toplevel(self.root)
         win.title("Ledger")
-        win.geometry("720x420")
+        win.geometry("820x420")
         win.transient(self.root)
 
-        ttk.Label(win, text=f"Ledger: {len(videos)} videos  |  "
-                  f"Next: {ledger.get('next', '?')}",
+        ttk.Label(win, text=f"Ledger: {len(videos)} videos",
                   font=("Helvetica", 12, "bold"),
                   padding=10).pack(anchor="w")
 
         frame = ttk.Frame(win, padding=10)
         frame.pack(fill="both", expand=True)
 
-        cols = ("seq", "original", "processed", "validation")
+        cols = ("name", "shape", "rating", "original", "processed", "validation")
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=15)
-        tree.heading("seq", text="Seq #")
+        tree.heading("name", text="Name")
+        tree.heading("shape", text="Shape")
+        tree.heading("rating", text="Class")
         tree.heading("original", text="Original File")
         tree.heading("processed", text="Date")
         tree.heading("validation", text="Validation")
-        tree.column("seq", width=80, anchor="center")
-        tree.column("original", width=280)
-        tree.column("processed", width=160, anchor="center")
-        tree.column("validation", width=120, anchor="center")
+        tree.column("name", width=220)
+        tree.column("shape", width=70, anchor="center")
+        tree.column("rating", width=50, anchor="center")
+        tree.column("original", width=180)
+        tree.column("processed", width=140, anchor="center")
+        tree.column("validation", width=80, anchor="center")
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
@@ -722,16 +741,18 @@ class App:
         for v in videos:
             checks = v.get("validation", {})
             all_pass = all(checks.values()) if checks else None
-            status = "PASS" if all_pass is True else (
+            val_status = "PASS" if all_pass is True else (
                 "FAIL" if all_pass is False else "?")
             tree.insert("", "end", values=(
-                v.get("seq", ""),
+                v.get("name", v.get("seq", "")),
+                v.get("shape", ""),
+                v.get("rating", ""),
                 v.get("original", ""),
                 v.get("processed", ""),
-                status,
+                val_status,
             ))
 
-    # ── Phase 4: Watermark Preview ───────────────────────────────────────────
+    # ── Watermark Preview ────────────────────────────────────────────────────
 
     def _preview_watermark(self) -> None:
         inp = self.inp_var.get().strip()
@@ -743,15 +764,12 @@ class App:
             messagebox.showerror("Error", "Select a valid logo file.")
             return
 
-        videos = sorted(
-            f for f in os.listdir(inp)
-            if Path(f).suffix.lower() in VIDEO_EXTENSIONS
-        )
-        if not videos:
+        found = scan_input_videos(inp)
+        if not found:
             messagebox.showinfo("No Videos", "No video files in the input folder.")
             return
 
-        src = os.path.join(inp, videos[0])
+        fname, src, _cls = found[0]
         pct = self.pct_var.get()
         try:
             pad = int(self.pad_var.get() or 20)
@@ -763,7 +781,7 @@ class App:
 
         def _generate() -> None:
             tmp = watermark_preview_frame(src, logo, pct, pad)
-            self.root.after(0, lambda: self._show_preview(tmp, videos[0]))
+            self.root.after(0, lambda: self._show_preview(tmp, fname))
 
         threading.Thread(target=_generate, daemon=True).start()
 
@@ -780,7 +798,6 @@ class App:
             win.transient(self.root)
 
             photo = tk.PhotoImage(file=img_path)
-            # Store reference to prevent garbage collection
             win._photo = photo
 
             label = ttk.Label(win, image=photo)
@@ -798,24 +815,25 @@ class App:
             except OSError:
                 pass
 
-    # ── Phase 7: File Selection Dialog ───────────────────────────────────────
+    # ── File Selection Dialog ────────────────────────────────────────────────
 
-    def _show_file_selection(self, inp: str, out: str, logo: str,
-                             videos: list[str]) -> None:
+    def _show_file_selection(self, out: str, logo: str,
+                             found: list[tuple[str, str, str]]) -> None:
         win = tk.Toplevel(self.root)
         win.title("Select Videos to Process")
-        win.geometry("550x450")
+        win.geometry("600x450")
         win.transient(self.root)
         win.grab_set()
 
-        ttk.Label(win, text=f"Found {len(videos)} videos in input folder",
+        ttk.Label(win, text=f"Found {len(found)} videos",
                   font=("Helvetica", 12, "bold"),
                   padding=10).pack(anchor="w")
 
         btn_frame = ttk.Frame(win, padding=(10, 0))
         btn_frame.pack(fill="x")
 
-        check_vars: dict[str, tk.BooleanVar] = {}
+        # key = index in found list
+        check_vars: dict[int, tk.BooleanVar] = {}
 
         def select_all() -> None:
             for var in check_vars.values():
@@ -831,8 +849,7 @@ class App:
                    command=select_none).pack(side="left", padx=2)
 
         # Check which videos are already processed
-        prefix = self.prefix_var.get()
-        ledger = load_ledger(out, prefix)
+        ledger = load_ledger(out)
         processed = {v["original"] for v in ledger.get("videos", [])}
 
         # Scrollable checkbox list
@@ -850,32 +867,32 @@ class App:
         canvas.pack(side="left", fill="both", expand=True, padx=10, pady=5)
         scrollbar.pack(side="right", fill="y", pady=5)
 
-        # Mousewheel scrolling
         def _on_mousewheel(event: tk.Event) -> None:
             canvas.yview_scroll(-1 * event.delta, "units")
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
         win.bind("<Destroy>",
                  lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is win else None)
 
-        for fname in videos:
+        for idx, (fname, _path, cls) in enumerate(found):
             already = fname in processed
             var = tk.BooleanVar(value=not already)
-            check_vars[fname] = var
-            text = f"{fname}  (already processed)" if already else fname
+            check_vars[idx] = var
+            cls_label = f"[{cls}]" if cls else ""
+            suffix = "  (already processed)" if already else ""
+            text = f"{cls_label} {fname}{suffix}".strip()
             ttk.Checkbutton(scroll_frame, text=text,
                             variable=var).pack(anchor="w", padx=5, pady=1)
 
-        # Start / Cancel buttons
         bottom = ttk.Frame(win, padding=10)
         bottom.pack(fill="x")
 
         def _go() -> None:
-            selected = [f for f, var in check_vars.items() if var.get()]
+            selected = [found[idx] for idx, var in check_vars.items() if var.get()]
             win.destroy()
             if not selected:
                 messagebox.showinfo("Nothing Selected", "No videos selected.")
                 return
-            self._begin_processing(inp, out, logo, selected)
+            self._begin_processing(out, logo, selected)
 
         ttk.Button(bottom, text="Cancel",
                    command=win.destroy).pack(side="right", padx=4)
@@ -906,19 +923,20 @@ class App:
                 "macOS:  brew install ffmpeg")
             return
 
-        videos = sorted(
-            f for f in os.listdir(inp)
-            if Path(f).suffix.lower() in VIDEO_EXTENSIONS
-        )
-        if not videos:
+        found = scan_input_videos(inp)
+        if not found:
             messagebox.showinfo("Nothing to do",
                                 "No video files found in the input folder.")
             return
 
-        self._show_file_selection(inp, out, logo, videos)
+        # Apply default class to files without subfolder-inferred class
+        default_cls = "a" if self.class_var.get() == "adult" else "s"
+        found = [(f, p, c if c else default_cls) for f, p, c in found]
 
-    def _begin_processing(self, inp: str, out: str, logo: str,
-                          videos: list[str]) -> None:
+        self._show_file_selection(out, logo, found)
+
+    def _begin_processing(self, out: str, logo: str,
+                          found: list[tuple[str, str, str]]) -> None:
         self._persist()
         self.processing = True
         self._failed_videos = []
@@ -932,36 +950,39 @@ class App:
 
         threading.Thread(
             target=self._run,
-            args=(inp, out, logo, videos),
+            args=(out, logo, found),
             daemon=True,
         ).start()
 
-    def _run(self, inp: str, out: str, logo: str,
-             videos: list[str]) -> None:
-        prefix = self.prefix_var.get()
+    def _run(self, out: str, logo: str,
+             found: list[tuple[str, str, str]]) -> None:
         pct = self.pct_var.get()
         try:
             pad = int(self.pad_var.get() or 20)
         except ValueError:
             pad = 20
-        total = len(videos)
+        total = len(found)
 
         os.makedirs(out, exist_ok=True)
-        ledger = load_ledger(out, prefix)
-        self._ui(log=f"Found {total} video(s) to process")
-        self._ui(log=f"Ledger: starting at {prefix}{ledger['next']:03d}\n")
+        ledger = load_ledger(out)
 
-        # Phase 2: build set of already-processed originals
+        # Batch timestamp — shared by all videos in this run
+        batch_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self._ui(log=f"Found {total} video(s) to process")
+        self._ui(log=f"Batch: {batch_ts}\n")
+
+        # Build set of already-processed originals
         processed_originals = {v["original"] for v in ledger["videos"]}
 
         completed = 0
         skipped = 0
-        for i, fname in enumerate(videos):
+        idx = 0  # per-batch counter
+        for i, (fname, src, cls) in enumerate(found):
             if not self.processing:
                 self._ui(log="— Cancelled —")
                 break
 
-            # Phase 2: skip already-processed
+            # Skip already-processed
             if fname in processed_originals:
                 self._ui(
                     log=f"[{i + 1}/{total}]  {fname} — already processed, skipping",
@@ -970,9 +991,18 @@ class App:
                 skipped += 1
                 continue
 
-            num = ledger["next"]
-            seq = f"{prefix}{num:03d}"
-            src = os.path.join(inp, fname)
+            idx += 1
+
+            # Probe to get dimensions for shape classification
+            try:
+                w, h, _dur, _fps = probe(src)
+                shape = classify_shape(w, h)
+            except Exception:
+                shape = "unknown"
+                w, h = 0, 0
+
+            # Build the new name: shape-class-timestamp-index
+            seq = f"{shape}-{cls}-{batch_ts}-{idx:03d}"
             vdir = os.path.join(out, seq)
             os.makedirs(vdir, exist_ok=True)
             dst = os.path.join(vdir, f"{seq}.mp4")
@@ -989,7 +1019,7 @@ class App:
                 if black_end is not None:
                     self._ui(log=f"        black detected: {black_end:.2f}s — will replace")
 
-                # Phase 5: progress callback for encoding
+                # Progress callback for encoding
                 def _on_encode_progress(frac: float,
                                         _i: int = i, _total: int = total) -> None:
                     pct_str = f"{frac * 100:.0f}%"
@@ -1025,22 +1055,25 @@ class App:
                 shutil.move(src, raw_dst)
                 self._ui(log="        moved raw video")
 
-                # Update ledger
+                # Update ledger with rich metadata
                 ledger["videos"].append({
-                    "seq": seq,
+                    "name": seq,
                     "original": fname,
+                    "shape": shape,
+                    "rating": "adult" if cls == "a" else "safe",
+                    "width": w,
+                    "height": h,
+                    "batch_id": batch_ts,
                     "processed": datetime.now().isoformat(timespec="seconds"),
                     "validation": checks,
                 })
-                ledger["next"] = num + 1
                 save_ledger(out, ledger)
 
                 self._ui(log=f"        ✓ {seq} complete\n")
                 completed += 1
             except Exception as exc:
                 self._ui(log=f"        ✗ ERROR: {exc}\n")
-                self._failed_videos.append(fname)
-                # Clean up partial output
+                self._failed_videos.append((fname, src, cls))
                 shutil.rmtree(vdir, ignore_errors=True)
 
             self._ui(progress=(i + 1) / total * 100)
@@ -1072,27 +1105,26 @@ class App:
         self.processing = False
         self.status.set("Cancelling…")
 
-    # ── Phase 6: Retry Failed ────────────────────────────────────────────────
+    # ── Retry Failed ─────────────────────────────────────────────────────────
 
     def _retry_failed(self) -> None:
         if not self._failed_videos:
             return
 
-        inp = self.inp_var.get().strip()
         out = self.out_var.get().strip()
         logo = self.logo_var.get().strip()
 
-        still_exist = [f for f in self._failed_videos
-                       if os.path.isfile(os.path.join(inp, f))]
+        still_exist = [(f, p, c) for f, p, c in self._failed_videos
+                       if os.path.isfile(p)]
 
         if not still_exist:
             messagebox.showinfo("Nothing to Retry",
-                                "Failed videos are no longer in the input folder.")
+                                "Failed videos are no longer available.")
             self._failed_videos = []
             self.retry_btn.pack_forget()
             return
 
-        self._begin_processing(inp, out, logo, still_exist)
+        self._begin_processing(out, logo, still_exist)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
