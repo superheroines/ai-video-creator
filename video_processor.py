@@ -390,6 +390,103 @@ def watermark(src: str, logo: str, dst: str, logo_pct: int = 10,
             pass
 
 
+def watermark_4x5(src: str, logo: str, dst: str, logo_pct: int = 10,
+                  padding: int = 20, on_progress: object = None) -> None:
+    """Centre-crop *src* to 4:5, overlay *logo*, write Bunny-safe MP4 to *dst*.
+
+    Uses the same encoding settings as watermark() but crops the video
+    to the largest 4:5 rectangle centred in the frame, with the logo
+    sized independently for the cropped dimensions.
+    """
+    w, h, dur, fps = probe(src)
+    if w == 0:
+        raise RuntimeError("Cannot read video dimensions")
+    if fps <= 0:
+        fps = 30.0
+
+    # Calculate 4:5 centre crop
+    if w / h > 4 / 5:
+        crop_h = h
+        crop_w = int(h * 4 / 5)
+    else:
+        crop_w = w
+        crop_h = int(w * 5 / 4)
+    crop_w = crop_w - (crop_w % 2)
+    crop_h = crop_h - (crop_h % 2)
+
+    gop = max(int(round(fps * 2)), 1)
+    logo_w = max(int(crop_w * logo_pct / 100), 20)
+
+    tail = (
+        f"pad=ceil(iw/2)*2:ceil(ih/2)*2,"
+        f"format=yuv420p,"
+        f"fps={fps},"
+        f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
+        f"setpts=PTS-STARTPTS"
+    )
+
+    filt = (
+        f"[0:v]crop={crop_w}:{crop_h}[cropped];"
+        f"[1:v]scale={logo_w}:-1:flags=lanczos,format=rgba[logo];"
+        f"[cropped][logo]overlay={padding}:main_h-overlay_h-{padding},"
+        f"{tail}[out]"
+    )
+
+    cmd = [
+        FFMPEG, "-y", "-i", str(src), "-i", str(logo),
+        "-filter_complex", filt,
+        "-map", "[out]", "-map", "0:a?",
+        "-af", "asetpts=PTS-STARTPTS",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-profile:v", "high",
+        "-level:v", "4.1",
+        "-pix_fmt", "yuv420p",
+        "-g", str(gop),
+        "-keyint_min", str(gop),
+        "-sc_threshold", "0",
+        "-force_key_frames", "0,0.5",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ac", "2",
+        "-ar", "48000",
+        "-movflags", "+faststart+negative_cts_offsets",
+        "-avoid_negative_ts", "make_zero",
+        "-fflags", "+genpts",
+        "-map_metadata", "-1",
+        "-fps_mode", "cfr",
+        str(dst),
+    ]
+    time_re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stderr_buf = []
+    buf = ""
+    for char in iter(lambda: proc.stderr.read(1), ""):
+        if char in ("\r", "\n"):
+            if buf.strip():
+                stderr_buf.append(buf)
+                if on_progress and dur > 0:
+                    match = time_re.search(buf)
+                    if match:
+                        hh, mm, ss = match.groups()
+                        elapsed = int(hh) * 3600 + int(mm) * 60 + float(ss)
+                        on_progress(min(elapsed / dur, 1.0))
+            buf = ""
+        else:
+            buf += char
+    proc.wait()
+    if proc.returncode != 0:
+        err_text = "\n".join(stderr_buf[-20:])
+        raise RuntimeError(err_text[-800:])
+
+
 def watermark_preview_frame(src: str, logo: str, logo_pct: int = 10,
                             padding: int = 20) -> str | None:
     """Extract one frame from *src*, overlay *logo*, return path to temp PNG.
@@ -1104,6 +1201,11 @@ class App:
                 self._ui(log="        encoding with watermark…")
                 watermark(src, logo, dst, pct, pad, black_end=black_end,
                           on_progress=_on_encode_progress)
+
+                # 4:5 centre-cropped video with independent logo
+                dst_4x5 = os.path.join(vdir, f"{seq}-4x5.mp4")
+                self._ui(log="        encoding 4:5 version…")
+                watermark_4x5(src, logo, dst_4x5, pct, pad)
 
                 # Validate export
                 self._ui(log="        validating export…")
