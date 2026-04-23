@@ -764,7 +764,7 @@ class App:
         self.status = tk.StringVar(value="Ready")
         ttk.Label(pf, textvariable=self.status).pack(anchor="w")
         self.log = tk.Text(pf, height=10, font=("Courier", 9),
-                           state="disabled", bg="#f5f5f5")
+                           state="disabled", bg="#f5f5f5", fg="#1a1a1a")
         self.log.pack(fill="both", expand=True, pady=(4, 0))
 
         # ── Buttons ──
