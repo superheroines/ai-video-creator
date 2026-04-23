@@ -431,13 +431,18 @@ def watermark_preview_frame(src: str, logo: str, logo_pct: int = 10,
 
 
 def snapshots(video: str, out_dir: str, prefix: str,
-              count: int = THUMBNAIL_COUNT) -> None:
+              count: int = THUMBNAIL_COUNT,
+              raw_video: str | None = None,
+              logo: str | None = None,
+              logo_pct: int = 10, padding: int = 20) -> None:
     """
     Extract *count* evenly-spaced PNG snapshots from *video*.
     Also creates:
       - a 6x4 contact-sheet JPEG (native aspect ratio)
-      - 4:5 centre-cropped versions for Instagram / social media
-    Files are named {prefix}-snapshot-01.png, {prefix}-4x5-01.png, etc.
+      - 4:5 centre-cropped versions with independent logo overlay
+    Native snapshots come from *video* (already watermarked).
+    4:5 crops come from *raw_video* (no watermark), centre-cropped,
+    with the logo overlaid at a size appropriate for the 4:5 frame.
     """
     os.makedirs(out_dir, exist_ok=True)
     w, h, dur, _fps = probe(video)
@@ -445,28 +450,33 @@ def snapshots(video: str, out_dir: str, prefix: str,
         raise RuntimeError("Cannot determine video duration")
 
     # Calculate the 4:5 centre crop dimensions
-    # Fit the largest 4:5 rectangle inside the video frame
     if w / h > 4 / 5:
-        # Video is wider than 4:5 — use full height, crop width
         crop_h = h
         crop_w = int(h * 4 / 5)
     else:
-        # Video is taller than or equal to 4:5 — use full width, crop height
         crop_w = w
         crop_h = int(w * 5 / 4)
-    # Ensure even dimensions for codec compatibility
     crop_w = crop_w - (crop_w % 2)
     crop_h = crop_h - (crop_h % 2)
-    crop_filter = f"crop={crop_w}:{crop_h}"
+
+    # For 4:5 crops: use raw video + logo overlay if available
+    do_4x5 = raw_video and logo and os.path.isfile(raw_video) and os.path.isfile(logo)
+    if do_4x5:
+        logo_w_4x5 = max(int(crop_w * logo_pct / 100), 20)
+        crop_filt = (
+            f"[0:v]crop={crop_w}:{crop_h}[cropped];"
+            f"[1:v]scale={logo_w_4x5}:-1:flags=lanczos,format=rgba[logo];"
+            f"[cropped][logo]overlay={padding}:main_h-overlay_h-{padding}[out]"
+        )
 
     ok_count = 0
+    ok_4x5 = 0
     for i in range(count):
         t = (i / max(count - 1, 1)) * dur
-        # Native aspect ratio snapshot
         native_out = os.path.join(out_dir, f"{prefix}-snapshot-{i + 1:02d}.png")
-        # 4:5 centre-cropped snapshot
         crop_out = os.path.join(out_dir, f"{prefix}-4x5-{i + 1:02d}.png")
 
+        # Native snapshot from watermarked video
         r = subprocess.run(
             [
                 FFMPEG, "-y",
@@ -481,18 +491,24 @@ def snapshots(video: str, out_dir: str, prefix: str,
         if r.returncode == 0 and os.path.exists(native_out):
             ok_count += 1
 
-        subprocess.run(
-            [
-                FFMPEG, "-y",
-                "-ss", f"{t:.3f}",
-                "-i", str(video),
-                "-vf", crop_filter,
-                "-vframes", "1",
-                "-q:v", "2",
-                str(crop_out),
-            ],
-            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
-        )
+        # 4:5 crop from raw video with independent logo overlay
+        if do_4x5:
+            r2 = subprocess.run(
+                [
+                    FFMPEG, "-y",
+                    "-ss", f"{t:.3f}",
+                    "-i", str(raw_video),
+                    "-i", str(logo),
+                    "-filter_complex", crop_filt,
+                    "-map", "[out]",
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    str(crop_out),
+                ],
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+            if r2.returncode == 0 and os.path.exists(crop_out):
+                ok_4x5 += 1
 
     if ok_count >= 2:
         # Native contact sheet
@@ -511,9 +527,13 @@ def snapshots(video: str, out_dir: str, prefix: str,
             ],
             capture_output=True, encoding="utf-8", errors="replace", timeout=60,
         )
+
+    if ok_4x5 >= 2:
         # 4:5 contact sheet
         sheet_4x5_in = os.path.join(out_dir, f"{prefix}-4x5-%02d.png")
         sheet_4x5_out = os.path.join(out_dir, f"{prefix}-4x5-contact-sheet.jpg")
+        cols = 6
+        rows = math.ceil(count / cols)
         subprocess.run(
             [
                 FFMPEG, "-y",
@@ -1096,7 +1116,9 @@ class App:
 
                 # Extract thumbnails
                 self._ui(log="        extracting thumbnails…")
-                snapshots(dst, vdir, seq, THUMBNAIL_COUNT)
+                snapshots(dst, vdir, seq, THUMBNAIL_COUNT,
+                          raw_video=src, logo=logo,
+                          logo_pct=pct, padding=pad)
 
                 # Move raw video into the output folder
                 raw_ext = Path(fname).suffix
