@@ -787,6 +787,8 @@ class App:
                    command=self._open_output).pack(side="left", padx=4)
         ttk.Button(bf, text="View Ledger",
                    command=self._view_ledger).pack(side="left", padx=4)
+        ttk.Button(bf, text="Reset Ledger",
+                   command=self._reset_ledger).pack(side="left", padx=4)
 
     # ── row builders ────────────────────────────────────────────────────────
 
@@ -917,6 +919,33 @@ class App:
                 v.get("processed", ""),
                 val_status,
             ))
+
+    # ── Reset Ledger ─────────────────────────────────────────────────────────
+
+    def _reset_ledger(self) -> None:
+        out = self.out_var.get().strip()
+        if not out or not os.path.isdir(out):
+            messagebox.showinfo("No Folder", "Set a valid output folder first.")
+            return
+
+        ledger = load_ledger(out)
+        count = len(ledger.get("videos", []))
+        if count == 0:
+            messagebox.showinfo("Empty", "Ledger is already empty.")
+            return
+
+        if not messagebox.askyesno(
+            "Reset Ledger",
+            f"This will clear {count} entries from the ledger.\n\n"
+            "Processed files will NOT be deleted, but the app will\n"
+            "no longer recognise them as already processed.\n\n"
+            "Continue?",
+        ):
+            return
+
+        save_ledger(out, {"videos": []})
+        self._refresh_ledger_label()
+        self.status.set("Ledger reset")
 
     # ── Watermark Preview ────────────────────────────────────────────────────
 
