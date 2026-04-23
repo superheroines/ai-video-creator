@@ -434,18 +434,39 @@ def snapshots(video: str, out_dir: str, prefix: str,
               count: int = THUMBNAIL_COUNT) -> None:
     """
     Extract *count* evenly-spaced PNG snapshots from *video*.
-    Also creates a 6x4 contact-sheet JPEG.
-    Files are named {prefix}-snapshot-01.png, etc.
+    Also creates:
+      - a 6x4 contact-sheet JPEG (native aspect ratio)
+      - 4:5 centre-cropped versions for Instagram / social media
+    Files are named {prefix}-snapshot-01.png, {prefix}-4x5-01.png, etc.
     """
     os.makedirs(out_dir, exist_ok=True)
-    _w, _h, dur, _fps = probe(video)
+    w, h, dur, _fps = probe(video)
     if dur <= 0:
         raise RuntimeError("Cannot determine video duration")
+
+    # Calculate the 4:5 centre crop dimensions
+    # Fit the largest 4:5 rectangle inside the video frame
+    if w / h > 4 / 5:
+        # Video is wider than 4:5 — use full height, crop width
+        crop_h = h
+        crop_w = int(h * 4 / 5)
+    else:
+        # Video is taller than or equal to 4:5 — use full width, crop height
+        crop_w = w
+        crop_h = int(w * 5 / 4)
+    # Ensure even dimensions for codec compatibility
+    crop_w = crop_w - (crop_w % 2)
+    crop_h = crop_h - (crop_h % 2)
+    crop_filter = f"crop={crop_w}:{crop_h}"
 
     ok_count = 0
     for i in range(count):
         t = (i / max(count - 1, 1)) * dur
-        out = os.path.join(out_dir, f"{prefix}-snapshot-{i + 1:02d}.png")
+        # Native aspect ratio snapshot
+        native_out = os.path.join(out_dir, f"{prefix}-snapshot-{i + 1:02d}.png")
+        # 4:5 centre-cropped snapshot
+        crop_out = os.path.join(out_dir, f"{prefix}-4x5-{i + 1:02d}.png")
+
         r = subprocess.run(
             [
                 FFMPEG, "-y",
@@ -453,14 +474,28 @@ def snapshots(video: str, out_dir: str, prefix: str,
                 "-i", str(video),
                 "-vframes", "1",
                 "-q:v", "2",
-                str(out),
+                str(native_out),
             ],
             capture_output=True, encoding="utf-8", errors="replace", timeout=30,
         )
-        if r.returncode == 0 and os.path.exists(out):
+        if r.returncode == 0 and os.path.exists(native_out):
             ok_count += 1
 
+        subprocess.run(
+            [
+                FFMPEG, "-y",
+                "-ss", f"{t:.3f}",
+                "-i", str(video),
+                "-vf", crop_filter,
+                "-vframes", "1",
+                "-q:v", "2",
+                str(crop_out),
+            ],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+
     if ok_count >= 2:
+        # Native contact sheet
         sheet_in = os.path.join(out_dir, f"{prefix}-snapshot-%02d.png")
         sheet_out = os.path.join(out_dir, f"{prefix}-contact-sheet.jpg")
         cols = 6
@@ -473,6 +508,20 @@ def snapshots(video: str, out_dir: str, prefix: str,
                 "-vf", f"scale=320:-1,tile={cols}x{rows}",
                 "-q:v", "3",
                 str(sheet_out),
+            ],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+        # 4:5 contact sheet
+        sheet_4x5_in = os.path.join(out_dir, f"{prefix}-4x5-%02d.png")
+        sheet_4x5_out = os.path.join(out_dir, f"{prefix}-4x5-contact-sheet.jpg")
+        subprocess.run(
+            [
+                FFMPEG, "-y",
+                "-start_number", "1",
+                "-i", sheet_4x5_in,
+                "-vf", f"scale=256:-1,tile={cols}x{rows}",
+                "-q:v", "3",
+                str(sheet_4x5_out),
             ],
             capture_output=True, encoding="utf-8", errors="replace", timeout=60,
         )
