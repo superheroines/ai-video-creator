@@ -123,13 +123,41 @@ def probe(filepath: str) -> tuple[int, int, float, float]:
     return w, h, dur, fps
 
 
-def classify_shape(w: int, h: int) -> str:
-    """Classify aspect ratio as portrait, landscape, or square."""
-    if w > h:
-        return "landscape"
-    if h > w:
-        return "portrait"
-    return "square"
+def detect_aspect_ratio(w: int, h: int) -> str:
+    """Return the common aspect ratio as 'WxH' string (e.g. '16x9', '9x16', '1x1').
+
+    Snaps to the nearest common ratio if within tolerance, otherwise
+    uses the simplified ratio from GCD.
+    """
+    if w <= 0 or h <= 0:
+        return "0x0"
+
+    common = [
+        (16, 9), (9, 16),
+        (4, 3), (3, 4),
+        (4, 5), (5, 4),
+        (1, 1),
+        (21, 9), (9, 21),
+        (3, 2), (2, 3),
+    ]
+    ratio = w / h
+    for cw, ch in common:
+        if abs(ratio - cw / ch) < 0.02:
+            return f"{cw}x{ch}"
+
+    # Fall back to simplified ratio via GCD
+    g = math.gcd(w, h)
+    rw, rh = w // g, h // g
+    # Cap very large ratios (e.g. 683x384 from odd resolutions)
+    if rw > 99 or rh > 99:
+        # Approximate to nearest integer ratio
+        if w >= h:
+            rh_approx = round(h * 16 / w)
+            return f"16x{rh_approx}" if rh_approx > 0 else f"{rw}x{rh}"
+        else:
+            rw_approx = round(w * 16 / h)
+            return f"{rw_approx}x16" if rw_approx > 0 else f"{rw}x{rh}"
+    return f"{rw}x{rh}"
 
 
 def scan_input_videos(inp: str) -> list[tuple[str, str, str]]:
@@ -531,7 +559,8 @@ def snapshots(video: str, out_dir: str, prefix: str,
               count: int = THUMBNAIL_COUNT,
               raw_video: str | None = None,
               logo: str | None = None,
-              logo_pct: int = 10, padding: int = 20) -> None:
+              logo_pct: int = 10, padding: int = 20,
+              prefix_4x5: str | None = None) -> None:
     """
     Extract *count* evenly-spaced PNG snapshots from *video*.
     Also creates:
@@ -557,6 +586,7 @@ def snapshots(video: str, out_dir: str, prefix: str,
     crop_h = crop_h - (crop_h % 2)
 
     # For 4:5 crops: use raw video + logo overlay if available
+    pfx_4x5 = prefix_4x5 or f"{prefix}-4x5"
     do_4x5 = raw_video and logo and os.path.isfile(raw_video) and os.path.isfile(logo)
     if do_4x5:
         logo_w_4x5 = max(int(crop_w * logo_pct / 100), 20)
@@ -571,7 +601,7 @@ def snapshots(video: str, out_dir: str, prefix: str,
     for i in range(count):
         t = (i / max(count - 1, 1)) * dur
         native_out = os.path.join(out_dir, f"{prefix}-snapshot-{i + 1:02d}.png")
-        crop_out = os.path.join(out_dir, f"{prefix}-4x5-{i + 1:02d}.png")
+        crop_out = os.path.join(out_dir, f"{pfx_4x5}-snapshot-{i + 1:02d}.png")
 
         # Native snapshot from watermarked video
         r = subprocess.run(
@@ -627,8 +657,8 @@ def snapshots(video: str, out_dir: str, prefix: str,
 
     if ok_4x5 >= 2:
         # 4:5 contact sheet
-        sheet_4x5_in = os.path.join(out_dir, f"{prefix}-4x5-%02d.png")
-        sheet_4x5_out = os.path.join(out_dir, f"{prefix}-4x5-contact-sheet.jpg")
+        sheet_4x5_in = os.path.join(out_dir, f"{pfx_4x5}-snapshot-%02d.png")
+        sheet_4x5_out = os.path.join(out_dir, f"{pfx_4x5}-contact-sheet.jpg")
         cols = 6
         rows = math.ceil(count / cols)
         subprocess.run(
@@ -1191,13 +1221,14 @@ class App:
             # Probe to get dimensions for shape classification
             try:
                 w, h, _dur, _fps = probe(src)
-                shape = classify_shape(w, h)
+                shape = detect_aspect_ratio(w, h)
             except Exception:
                 shape = "unknown"
                 w, h = 0, 0
 
-            # Build the new name: shape-class-timestamp-index
+            # Build the new name: aspect-class-timestamp-index
             seq = f"{shape}-{cls}-{batch_ts}-{idx:03d}"
+            seq_4x5 = f"4x5-{cls}-{batch_ts}-{idx:03d}"
             vdir = os.path.join(out, seq)
             os.makedirs(vdir, exist_ok=True)
             dst = os.path.join(vdir, f"{seq}.mp4")
@@ -1232,7 +1263,7 @@ class App:
                           on_progress=_on_encode_progress)
 
                 # 4:5 centre-cropped video with independent logo
-                dst_4x5 = os.path.join(vdir, f"{seq}-4x5.mp4")
+                dst_4x5 = os.path.join(vdir, f"{seq_4x5}.mp4")
                 self._ui(log="        encoding 4:5 version…")
                 watermark_4x5(src, logo, dst_4x5, pct, pad)
 
@@ -1249,7 +1280,8 @@ class App:
                 self._ui(log="        extracting thumbnails…")
                 snapshots(dst, vdir, seq, THUMBNAIL_COUNT,
                           raw_video=src, logo=logo,
-                          logo_pct=pct, padding=pad)
+                          logo_pct=pct, padding=pad,
+                          prefix_4x5=seq_4x5)
 
                 # Move raw video into the output folder
                 raw_ext = Path(fname).suffix
