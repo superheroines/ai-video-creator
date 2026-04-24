@@ -1226,12 +1226,13 @@ class App:
                 shape = "unknown"
                 w, h = 0, 0
 
-            # Build the new name: aspect-class-timestamp-index
-            seq = f"{shape}-{cls}-{batch_ts}-{idx:03d}"
-            seq_4x5 = f"4x5-{cls}-{batch_ts}-{idx:03d}"
+            # Build names: base-aspect for files, base for folder
+            seq = f"a-{batch_ts}-{idx:03d}"
+            seq_native = f"{seq}-{shape}"
+            seq_4x5 = f"{seq}-4x5"
             vdir = os.path.join(out, seq)
             os.makedirs(vdir, exist_ok=True)
-            dst = os.path.join(vdir, f"{seq}.mp4")
+            dst = os.path.join(vdir, f"{seq_native}.mp4")
 
             self._ui(
                 status=f"Processing {seq}  ({i + 1}/{total})",
@@ -1263,7 +1264,7 @@ class App:
                           on_progress=_on_encode_progress)
 
                 # 4:5 centre-cropped video with independent logo
-                dst_4x5 = os.path.join(vdir, f"{seq_4x5}.mp4")
+                dst_4x5 = os.path.join(vdir, f"{seq}-4x5.mp4")
                 self._ui(log="        encoding 4:5 version…")
                 watermark_4x5(src, logo, dst_4x5, pct, pad)
 
@@ -1278,14 +1279,14 @@ class App:
 
                 # Extract thumbnails
                 self._ui(log="        extracting thumbnails…")
-                snapshots(dst, vdir, seq, THUMBNAIL_COUNT,
+                snapshots(dst, vdir, seq_native, THUMBNAIL_COUNT,
                           raw_video=src, logo=logo,
                           logo_pct=pct, padding=pad,
                           prefix_4x5=seq_4x5)
 
                 # Move raw video into the output folder
                 raw_ext = Path(fname).suffix
-                raw_dst = os.path.join(vdir, f"{seq}-raw{raw_ext}")
+                raw_dst = os.path.join(vdir, f"{seq_native}-raw{raw_ext}")
                 shutil.move(src, raw_dst)
                 self._ui(log="        moved raw video")
 
