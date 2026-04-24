@@ -560,7 +560,8 @@ def snapshots(video: str, out_dir: str, prefix: str,
               raw_video: str | None = None,
               logo: str | None = None,
               logo_pct: int = 10, padding: int = 20,
-              prefix_4x5: str | None = None) -> None:
+              prefix_4x5: str | None = None,
+              out_dir_4x5: str | None = None) -> None:
     """
     Extract *count* evenly-spaced PNG snapshots from *video*.
     Also creates:
@@ -587,7 +588,10 @@ def snapshots(video: str, out_dir: str, prefix: str,
 
     # For 4:5 crops: use raw video + logo overlay if available
     pfx_4x5 = prefix_4x5 or f"{prefix}-4x5"
+    dir_4x5 = out_dir_4x5 or out_dir
     do_4x5 = raw_video and logo and os.path.isfile(raw_video) and os.path.isfile(logo)
+    if do_4x5:
+        os.makedirs(dir_4x5, exist_ok=True)
     if do_4x5:
         logo_w_4x5 = max(int(crop_w * logo_pct / 100), 20)
         crop_filt = (
@@ -601,7 +605,7 @@ def snapshots(video: str, out_dir: str, prefix: str,
     for i in range(count):
         t = (i / max(count - 1, 1)) * dur
         native_out = os.path.join(out_dir, f"{prefix}-snapshot-{i + 1:02d}.png")
-        crop_out = os.path.join(out_dir, f"{pfx_4x5}-snapshot-{i + 1:02d}.png")
+        crop_out = os.path.join(dir_4x5, f"{pfx_4x5}-snapshot-{i + 1:02d}.png")
 
         # Native snapshot from watermarked video
         r = subprocess.run(
@@ -657,8 +661,8 @@ def snapshots(video: str, out_dir: str, prefix: str,
 
     if ok_4x5 >= 2:
         # 4:5 contact sheet
-        sheet_4x5_in = os.path.join(out_dir, f"{pfx_4x5}-snapshot-%02d.png")
-        sheet_4x5_out = os.path.join(out_dir, f"{pfx_4x5}-contact-sheet.jpg")
+        sheet_4x5_in = os.path.join(dir_4x5, f"{pfx_4x5}-snapshot-%02d.png")
+        sheet_4x5_out = os.path.join(dir_4x5, f"{pfx_4x5}-contact-sheet.jpg")
         cols = 6
         rows = math.ceil(count / cols)
         subprocess.run(
@@ -943,7 +947,7 @@ class App:
                 "FAIL" if all_pass is False else "?")
             tree.insert("", "end", values=(
                 v.get("name", v.get("seq", "")),
-                v.get("shape", ""),
+                v.get("aspect_ratio", v.get("shape", "")),
                 v.get("rating", ""),
                 v.get("original", ""),
                 v.get("processed", ""),
@@ -1226,17 +1230,19 @@ class App:
                 shape = "unknown"
                 w, h = 0, 0
 
-            # Build names: base-aspect for files, base for folder
-            seq = f"a-{batch_ts}-{idx:03d}"
-            seq_native = f"{seq}-{shape}"
-            seq_4x5 = f"{seq}-4x5"
-            vdir = os.path.join(out, seq)
-            os.makedirs(vdir, exist_ok=True)
-            dst = os.path.join(vdir, f"{seq_native}.mp4")
+            # Build names: separate folders per aspect ratio
+            base = f"{batch_ts}-{idx:03d}"
+            seq_native = f"{shape}-{base}"
+            seq_4x5 = f"4x5-{base}"
+            vdir_native = os.path.join(out, seq_native)
+            vdir_4x5 = os.path.join(out, seq_4x5)
+            os.makedirs(vdir_native, exist_ok=True)
+            os.makedirs(vdir_4x5, exist_ok=True)
+            dst = os.path.join(vdir_native, f"{seq_native}.mp4")
 
             self._ui(
-                status=f"Processing {seq}  ({i + 1}/{total})",
-                log=f"[{i + 1}/{total}]  {seq}  ←  {fname}",
+                status=f"Processing {seq_native}  ({i + 1}/{total})",
+                log=f"[{i + 1}/{total}]  {seq_native}  ←  {fname}",
             )
 
             try:
@@ -1254,7 +1260,7 @@ class App:
                     file_weight = 1.0 / _total
                     overall = (file_base + frac * file_weight * 0.8) * 100
                     self._ui(
-                        status=f"Encoding {seq}  ({_i + 1}/{_total})  {pct_str}",
+                        status=f"Encoding {seq_native}  ({_i + 1}/{_total})  {pct_str}",
                         progress=overall,
                     )
 
@@ -1264,7 +1270,7 @@ class App:
                           on_progress=_on_encode_progress)
 
                 # 4:5 centre-cropped video with independent logo
-                dst_4x5 = os.path.join(vdir, f"{seq}-4x5.mp4")
+                dst_4x5 = os.path.join(vdir_4x5, f"{seq_4x5}.mp4")
                 self._ui(log="        encoding 4:5 version…")
                 watermark_4x5(src, logo, dst_4x5, pct, pad)
 
@@ -1277,24 +1283,25 @@ class App:
                 else:
                     self._ui(log="        export validation passed")
 
-                # Extract thumbnails
+                # Extract thumbnails — native into native folder, 4:5 into 4:5 folder
                 self._ui(log="        extracting thumbnails…")
-                snapshots(dst, vdir, seq_native, THUMBNAIL_COUNT,
+                snapshots(dst, vdir_native, seq_native, THUMBNAIL_COUNT,
                           raw_video=src, logo=logo,
                           logo_pct=pct, padding=pad,
-                          prefix_4x5=seq_4x5)
+                          prefix_4x5=seq_4x5,
+                          out_dir_4x5=vdir_4x5)
 
-                # Move raw video into the output folder
+                # Move raw video into the native folder
                 raw_ext = Path(fname).suffix
-                raw_dst = os.path.join(vdir, f"{seq_native}-raw{raw_ext}")
+                raw_dst = os.path.join(vdir_native, f"{seq_native}-raw{raw_ext}")
                 shutil.move(src, raw_dst)
                 self._ui(log="        moved raw video")
 
                 # Update ledger with rich metadata
                 ledger["videos"].append({
-                    "name": seq,
+                    "name": seq_native,
                     "original": fname,
-                    "shape": shape,
+                    "aspect_ratio": shape,
                     "rating": "adult" if cls == "a" else "safe",
                     "width": w,
                     "height": h,
@@ -1304,12 +1311,13 @@ class App:
                 })
                 save_ledger(out, ledger)
 
-                self._ui(log=f"        ✓ {seq} complete\n")
+                self._ui(log=f"        ✓ {seq_native} complete\n")
                 completed += 1
             except Exception as exc:
                 self._ui(log=f"        ✗ ERROR: {exc}\n")
                 self._failed_videos.append((fname, src, cls))
-                shutil.rmtree(vdir, ignore_errors=True)
+                shutil.rmtree(vdir_native, ignore_errors=True)
+                shutil.rmtree(vdir_4x5, ignore_errors=True)
 
             self._ui(progress=(i + 1) / total * 100)
 
